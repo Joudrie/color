@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
 import { rgbaToLab } from '../lib/color'
+import { sobelMagnitude } from '../lib/gradient'
 import { median3x3 } from '../lib/median'
 import { segmentImage, type Segmentation } from '../lib/segment'
 import type { SegmentStats, WorkerRequest } from '../types'
@@ -7,16 +8,34 @@ import type { SegmentStats, WorkerRequest } from '../types'
 const MAX_EDGE = 1400
 
 /**
- * Simple -> detailed. `k` is the colour-quantisation count, `minFrac` the
- * smallest region we keep as a share of image area. Together they set how many
- * shapes the page has, which is the only thing "detail" means on a coloring page.
+ * Lightness counts for ~40% of what hue does when deciding whether two pixels
+ * belong to the same thing. Shadows, highlights and wrinkles are L-only
+ * variation; object identity lives in a/b.
+ */
+const L_WEIGHT = 0.4
+
+/**
+ * Simple -> detailed.
+ *
+ * `k` over-segments on colour; `colorThreshold` then merges neighbours back
+ * together below that perceptual distance — that pair is what decides whether a
+ * shirt reads as one shape or as lighting bands. `minFrac` is the smallest
+ * region kept, and `preserve` the colour distance at which a small region is
+ * spared anyway (eyes, nostrils, lips).
+ */
+/**
+ * `edgePct` is a percentile of the photo's own gradient distribution, not an
+ * absolute number. A textured photo (fur, foliage) has strong gradients
+ * everywhere, so "this is a real edge" has to mean "strong relative to *this*
+ * image" — an absolute threshold protects every fur strand in one photo and
+ * nothing at all in another.
  */
 const LEVELS = [
-  { k: 6, minFrac: 0.0022, lineWeight: 1 },
-  { k: 9, minFrac: 0.0013, lineWeight: 1 },
-  { k: 12, minFrac: 0.0008, lineWeight: 1 },
-  { k: 16, minFrac: 0.00045, lineWeight: 0 },
-  { k: 22, minFrac: 0.00025, lineWeight: 0 },
+  { k: 10, minFrac: 0.0022, colorThreshold: 15, preserve: 17, edgePct: 0.985, lineWeight: 1 },
+  { k: 14, minFrac: 0.0013, colorThreshold: 13, preserve: 16, edgePct: 0.98, lineWeight: 1 },
+  { k: 18, minFrac: 0.0008, colorThreshold: 11, preserve: 15, edgePct: 0.975, lineWeight: 1 },
+  { k: 24, minFrac: 0.00045, colorThreshold: 9, preserve: 14, edgePct: 0.97, lineWeight: 0 },
+  { k: 30, minFrac: 0.00025, colorThreshold: 7, preserve: 12, edgePct: 0.965, lineWeight: 0 },
 ]
 
 interface Loaded {
@@ -24,9 +43,12 @@ interface Loaded {
   h: number
   lab: Float32Array
   rgba: Uint8ClampedArray
+  grad: Float32Array
+  gradPercentile: (p: number) => number
 }
 
 let state: Loaded | null = null
+let lastEdgeThreshold = 0
 const cache = new Map<number, Segmentation>()
 
 function medianRGB(rgba: Uint8ClampedArray, w: number, h: number, passes: number): Uint8ClampedArray {
@@ -57,10 +79,35 @@ function load(bitmap: ImageBitmap): void {
   // Smooth in colour, not luma: the segmentation downstream is a colour
   // decision, so texture has to come out of all three channels.
   const rgba = medianRGB(raw, w, h, 2)
-  const lab = rgbaToLab(rgba, w * h)
+  const lab = rgbaToLab(rgba, w * h, L_WEIGHT)
+
+  // True luma, unweighted — this is the "is there actually an edge here?"
+  // signal the merge steps consult, so it must not be the flattened L.
+  const gray = new Uint8ClampedArray(w * h)
+  for (let i = 0; i < w * h; i++) {
+    const o = i * 4
+    gray[i] = 0.299 * rgba[o] + 0.587 * rgba[o + 1] + 0.114 * rgba[o + 2]
+  }
+  const grad = sobelMagnitude(gray, w, h)
+
+  const BINS = 1024
+  let gradMax = 0
+  for (let i = 0; i < grad.length; i++) if (grad[i] > gradMax) gradMax = grad[i]
+  const hist = new Int32Array(BINS)
+  const binScale = gradMax > 0 ? (BINS - 1) / gradMax : 0
+  for (let i = 0; i < grad.length; i++) hist[(grad[i] * binScale) | 0]++
+  const gradPercentile = (p: number): number => {
+    const want = p * grad.length
+    let acc = 0
+    for (let b = 0; b < BINS; b++) {
+      acc += hist[b]
+      if (acc >= want) return binScale > 0 ? b / binScale : 0
+    }
+    return gradMax
+  }
 
   cache.clear()
-  state = { w, h, lab, rgba }
+  state = { w, h, lab, rgba, grad, gradPercentile }
   const ms = Math.round(performance.now() - t0)
   console.log(`[pipeline] loaded ${w}x${h} in ${ms}ms`)
   self.postMessage({ type: 'loaded', width: w, height: h, ms })
@@ -73,9 +120,18 @@ function levelFor(detail: number): number {
 function segmentAt(levelIndex: number): Segmentation {
   const cached = cache.get(levelIndex)
   if (cached) return cached
-  const { w, h, lab, rgba } = state!
-  const { k, minFrac, lineWeight } = LEVELS[levelIndex]
-  const seg = segmentImage(lab, rgba, w, h, k, Math.max(24, minFrac * w * h), lineWeight)
+  const { w, h, lab, rgba, grad, gradPercentile } = state!
+  const { k, minFrac, colorThreshold, preserve, edgePct, lineWeight } = LEVELS[levelIndex]
+  const edgeThreshold = gradPercentile(edgePct)
+  const seg = segmentImage(lab, rgba, grad, w, h, {
+    k,
+    minSize: Math.max(24, minFrac * w * h),
+    colorThreshold,
+    preserveDistance: preserve,
+    edgeThreshold,
+    lineWeight,
+  })
+  lastEdgeThreshold = edgeThreshold
   cache.set(levelIndex, seg)
   return seg
 }
@@ -195,7 +251,7 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
       console.log(
         `[pipeline] detail=${msg.detail.toFixed(2)} regions=${stats.regions} ` +
           `interior=${stats.interiorRegions} largest=${(stats.largestOverallShare * 100).toFixed(1)}% ` +
-          `ink=${(stats.inkShare * 100).toFixed(1)}% ${stats.ms}ms`,
+          `ink=${(stats.inkShare * 100).toFixed(1)}% edgeT=${lastEdgeThreshold.toFixed(0)} ${stats.ms}ms`,
       )
 
       self.postMessage({ type: 'segment', line: lineImg, debug: debugImg, stats }, [

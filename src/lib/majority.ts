@@ -1,20 +1,22 @@
 /**
- * 3x3 mode filter over a small-alphabet index image.
+ * Square mode (majority) filter over a small-alphabet index image.
  *
- * Run after quantisation: it dissolves single-pixel speckle and smooths the
- * jagged boundaries k-means leaves behind, which is most of what stops a photo
- * from segmenting into a manageable number of regions.
+ * Run after quantisation: it dissolves speckle and rounds off the jagged
+ * boundaries k-means leaves behind. Boundary smoothness has to happen here
+ * rather than later, because merging regions only ever *removes* borders — it
+ * never creates a rough new one — so a smooth index map yields smooth lines
+ * all the way through.
  */
-export function majority3x3(src: Uint8Array, w: number, h: number, k: number): Uint8Array {
+export function majorityFilter(src: Uint8Array, w: number, h: number, k: number, radius: number): Uint8Array {
   const out = new Uint8Array(w * h)
   const counts = new Int32Array(k)
 
   for (let y = 0; y < h; y++) {
-    const y0 = y > 0 ? y - 1 : 0
-    const y2 = y < h - 1 ? y + 1 : h - 1
+    const y0 = Math.max(0, y - radius)
+    const y2 = Math.min(h - 1, y + radius)
     for (let x = 0; x < w; x++) {
-      const x0 = x > 0 ? x - 1 : 0
-      const x2 = x < w - 1 ? x + 1 : w - 1
+      const x0 = Math.max(0, x - radius)
+      const x2 = Math.min(w - 1, x + radius)
 
       counts.fill(0)
       for (let yy = y0; yy <= y2; yy++) {

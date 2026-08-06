@@ -49,33 +49,57 @@ mitigate.
    Segmentation is a colour decision, so texture has to come out of colour, not
    luma. (Use the 19-comparison median-of-9 sorting network, not a per-pixel sort —
    at 1.5M pixels a generic sort is seconds of work.)
-4. Convert to CIELAB. Merging decisions are perceptual: two greens a human calls
-   "the same green" can be far apart in RGB.
-5. Quantise colour with k-means in Lab (k-means++ init). Run the iterations on a
-   ~20k-pixel subsample, then assign all pixels to the resulting centroids — full
-   k-means over every pixel is pointlessly slow for identical output.
-6. Two passes of a 3×3 majority (mode) filter over the cluster-index image. This
-   dissolves speckle and smooths the jagged cluster boundaries, and is most of what
-   turns an unusable segmentation into a usable one.
-7. Connected-component labeling of *equal-valued* runs (two-pass union-find,
+4. Convert to CIELAB, and **scale L down to ~0.4 before any distance is
+   measured**. This is the single most important number in the app. Lighting,
+   shadow and wrinkles are almost entirely lightness variation, while "this is
+   still the same blue shirt" across a highlight is an a/b fact. At full L weight
+   every lit surface bands into contour lines and every face grows wrinkles.
+5. Also compute a Sobel gradient magnitude over *true, unweighted* luma. Keep it —
+   steps 8 and 9 need it to tell a real edge from a shading ramp.
+6. Quantise colour with k-means in the weighted Lab (k-means++ init). Run the
+   iterations on a ~20k-pixel subsample, then assign all pixels to the resulting
+   centroids — full k-means over every pixel is pointlessly slow for identical
+   output. Deliberately over-segment here; step 9 merges back.
+7. Majority (mode) filter over the cluster-index image: one 3×3 pass then two 5×5
+   passes. This dissolves speckle and rounds off jagged cluster boundaries.
+   Smoothness has to happen here, because merging only ever *removes* borders — it
+   never creates a rough new one — so a smooth index map yields smooth lines all
+   the way through.
+8. Connected-component labeling of *equal-valued* runs (two-pass union-find,
    4-connectivity). Output `Int32Array regionMap` plus per-region pixel count,
    bounding box, and mean colour.
-8. Merge every region below a minimum size into whichever neighbour shares the
-   longest border with it, and repeat until nothing small is left (cap ~8 passes).
-   Track adjacency only for the small regions so the bookkeeping scales with the
-   noise, not the image.
-9. Lines = every pixel with a 4-neighbour in a different region. Optionally dilate
-   by 1 for ink weight at low detail levels.
+9. Merge, in this order: small → similar → small again.
+   - **Small:** absorb regions below a minimum size into whichever neighbour shares
+     the longest border. Track adjacency only for the small regions so bookkeeping
+     scales with the noise, not the image. **Spare any small region that is either
+     chromatically distinct from that neighbour or ringed by a strong gradient** —
+     this exception is the only thing keeping eyes, nostrils and lips alive, and a
+     face without them reads as a blank mask.
+   - **Similar:** merge adjacent regions whose mean colours are close *and* whose
+     shared border is not a real edge. Both a shirt's lighting band and an eye look
+     like a colour change to a clustering algorithm; the difference is that one
+     border is a gradual ramp and the other is a step. Allow only one merge per
+     region per pass so a gradient can't chain-collapse in one go, and repeat ~4
+     passes.
+10. Lines = every pixel with a 4-neighbour in a different region. Optionally dilate
+    by 1 for ink weight at low detail levels.
 
-**The Detail slider** drives two numbers together: `k` (cluster count) and the
-minimum region size. That is the only thing "detail" means on a coloring page — how
-many shapes it has. Use ~5 discrete levels and **cache each level's segmentation**;
-revisiting a level is then instant and the slider feels live without any separate
-preview path.
+**Make the edge threshold a percentile of the photo's own gradient distribution,
+not an absolute number.** A textured photo (fur, foliage) has strong gradients
+everywhere, so "this is a real edge" has to mean "strong relative to *this* image".
+An absolute threshold protects every fur strand in one photo and nothing at all in
+another — when I tried one, the same value gave 487 regions on a dog and 28 on a
+portrait.
 
-    level 0: k=6,  minRegionFrac=0.0022    level 3: k=16, minRegionFrac=0.00045
-    level 1: k=9,  minRegionFrac=0.0013    level 4: k=22, minRegionFrac=0.00025
-    level 2: k=12, minRegionFrac=0.0008
+**The Detail slider** drives the cluster count, the minimum region size, and the two
+merge thresholds together. That is the only thing "detail" means on a coloring page
+— how many shapes it has. Use ~5 discrete levels and **cache each level's
+segmentation**; revisiting a level is then instant and the slider feels live without
+any separate preview path.
+
+    level 0: k=10, minFrac=0.0022,  colorThreshold=15, preserve=17, edgePct=0.985
+    level 2: k=18, minFrac=0.0008,  colorThreshold=11, preserve=15, edgePct=0.975
+    level 4: k=30, minFrac=0.00025, colorThreshold=7,  preserve=12, edgePct=0.965
 
 **Tap handling:** `regionMap[y * width + x]` → a region id. That is the whole
 operation. No traversal.
@@ -108,8 +132,10 @@ You cannot see the output, so build the instruments:
 - Log after every segmentation: total regions, interior regions (not touching the
   image edge), largest region as a share of the image, ink share, and elapsed ms.
 - Sanity targets on a normal photo at mid detail: **30–150 regions**, at least half
-  of them interior, segmentation under ~700ms. Under 20 regions means the image had
-  nothing to segment; thousands means the merge step isn't running.
+  of them interior, ink share 4–9%, segmentation under ~1.3s. Under 20 regions means
+  the image had nothing to segment; several hundred means a merge step isn't firing.
+- Log the resolved edge threshold too. If it looks nothing like the gradient scale
+  of the image, the percentile lookup is wrong and every other number will mislead.
 - Measure the largest region **including** the background. Measuring only interior
   regions hides the worst failure mode, where everything collapses into a single
   border-touching blob and the interior count is zero.
@@ -122,9 +148,16 @@ You cannot see the output, so build the instruments:
   concentric contour bands. It is a valid coloring page and a bad one. Detect it
   (very few interior regions, or regions that are long and thin) and tell the user
   the photo won't trace well rather than shipping them a contour map.
-- Faces lose fine features. Eyes and mouths come out as flat shapes. This is
-  inherent to colour segmentation and is not fixed by more clusters — more clusters
-  just adds noise elsewhere.
+- Thin lighting ribbons survive along arms, shoulders and other rounded surfaces.
+  Do **not** try to remove them with a thinness (isoperimetric) test — a smiling or
+  squinting eye is a crescent, so every threshold that catches a shading ribbon also
+  deletes the eyes. Losing a feature to remove an artefact is a bad trade.
+- Heavily textured subjects (a wrinkled pug, curly fur, foliage) segment into
+  pleasant abstract shapes but do not resolve individual features. The wrinkles are
+  genuine strong edges, so they are correctly kept — there is just no signal that
+  says an eye matters more than a fold.
+- Faces come out clean and recognisable, but flat: no shading, and the jawline is
+  often implied rather than drawn. That is the correct look for a coloring page.
 
 ## Stack
 

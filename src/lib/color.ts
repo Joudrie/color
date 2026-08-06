@@ -12,8 +12,16 @@ function labF(t: number): number {
   return t > 0.008856451679035631 ? Math.cbrt(t) : t / 0.12841854934601665 + 4 / 29
 }
 
-/** Returns a Float32Array of n*3 holding L, a, b per pixel. */
-export function rgbaToLab(rgba: Uint8ClampedArray, n: number): Float32Array {
+/**
+ * Returns a Float32Array of n*3 holding L, a, b per pixel.
+ *
+ * `lWeight` scales lightness down before any distance is measured. This is the
+ * single most important knob in the app: lighting, shadow and wrinkles are
+ * almost entirely L variation, while a shirt staying "the same blue" across a
+ * highlight is an a/b fact. Weighting L at ~0.4 means a lit and a shadowed part
+ * of one object cluster together instead of banding into contour lines.
+ */
+export function rgbaToLab(rgba: Uint8ClampedArray, n: number, lWeight = 1): Float32Array {
   const out = new Float32Array(n * 3)
   for (let i = 0; i < n; i++) {
     const o = i * 4
@@ -31,7 +39,7 @@ export function rgbaToLab(rgba: Uint8ClampedArray, n: number): Float32Array {
     const fz = labF(z)
 
     const t = i * 3
-    out[t] = 116 * fy - 16
+    out[t] = (116 * fy - 16) * lWeight
     out[t + 1] = 500 * (fx - fy)
     out[t + 2] = 200 * (fy - fz)
   }
