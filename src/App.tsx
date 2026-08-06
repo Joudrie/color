@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { detectContentRect } from './lib/letterbox'
+import { lineArtToImageData, runLineArt } from './lib/lineModel'
 import type { SegmentStats, WorkerResponse } from './types'
 
 type Status = 'empty' | 'loading' | 'ready'
+type Mode = 'regions' | 'ai'
+
+const MODEL_MAX_EDGE = 1024
 
 const SAMPLES = [
   { label: 'Dog', src: '/samples/pet.jpg' },
@@ -17,15 +22,22 @@ export default function App() {
   const inFlight = useRef(false)
   const pending = useRef<number | null>(null)
 
+  const sourceRef = useRef<ImageBitmap | null>(null)
+  const aiRef = useRef<ImageData | null>(null)
+
   const [status, setStatus] = useState<Status>('empty')
   const [detail, setDetail] = useState(0.5)
   const [debug, setDebug] = useState(false)
+  const [mode, setMode] = useState<Mode>('regions')
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiMs, setAiMs] = useState<number | null>(null)
   const [stats, setStats] = useState<SegmentStats | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   // Refs mirror state so the worker handler always reads current values.
   const detailRef = useRef(detail)
   const showDebugRef = useRef(debug)
+  const modeRef = useRef(mode)
 
   const paint = useCallback((img: ImageData | null) => {
     const canvas = canvasRef.current
@@ -66,7 +78,7 @@ export default function App() {
         debugRef.current = msg.debug
         setStats(msg.stats)
         setStatus('ready')
-        paint(showDebugRef.current ? msg.debug : msg.line)
+        if (modeRef.current === 'regions') paint(showDebugRef.current ? msg.debug : msg.line)
         const queued = pending.current
         if (queued !== null) {
           pending.current = null
@@ -90,8 +102,38 @@ export default function App() {
 
   useEffect(() => {
     showDebugRef.current = debug
-    paint(debug ? debugRef.current : lineRef.current)
+    if (modeRef.current === 'regions') paint(debug ? debugRef.current : lineRef.current)
   }, [debug, paint])
+
+  const runModel = useCallback(async () => {
+    const source = sourceRef.current
+    if (!source || aiBusy) return
+    if (aiRef.current) {
+      paint(aiRef.current)
+      return
+    }
+    setAiBusy(true)
+    try {
+      const t0 = performance.now()
+      const art = await runLineArt(source, MODEL_MAX_EDGE)
+      setAiMs(Math.round(performance.now() - t0))
+      const img = lineArtToImageData(art)
+      aiRef.current = img
+      if (modeRef.current === 'ai') paint(img)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'The line model failed to run.')
+    } finally {
+      setAiBusy(false)
+    }
+  }, [aiBusy, paint])
+
+  useEffect(() => {
+    modeRef.current = mode
+    if (mode === 'ai') void runModel()
+    else paint(showDebugRef.current ? debugRef.current : lineRef.current)
+    // runModel is intentionally omitted: it changes identity while running.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, paint])
 
   const ingest = useCallback(async (blob: Blob) => {
     setError(null)
@@ -99,17 +141,31 @@ export default function App() {
     setStats(null)
     debugRef.current = null
     lineRef.current = null
+    aiRef.current = null
+    setAiMs(null)
     inFlight.current = false
     pending.current = null
     try {
       // imageOrientation honours EXIF — without it every portrait phone photo
       // arrives on its side.
-      const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image' })
-      workerRef.current!.postMessage({ type: 'load', bitmap }, [bitmap])
+      const oriented = await createImageBitmap(blob, { imageOrientation: 'from-image' })
+      const rect = detectContentRect(oriented)
+
+      // Two crops: one is transferred to the worker (which closes it), one is
+      // kept here for the model.
+      const forWorker = await createImageBitmap(oriented, rect.x, rect.y, rect.w, rect.h)
+      const forModel = await createImageBitmap(oriented, rect.x, rect.y, rect.w, rect.h)
+      oriented.close()
+
+      sourceRef.current?.close()
+      sourceRef.current = forModel
+      workerRef.current!.postMessage({ type: 'load', bitmap: forWorker }, [forWorker])
+      if (modeRef.current === 'ai') void runModel()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not read that image.')
       setStatus('empty')
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const onFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -192,7 +248,32 @@ export default function App() {
           )}
 
           <div className="rounded-2xl bg-white border border-neutral-200 p-4 flex flex-col gap-3">
-            <div className="flex items-center gap-3">
+            <div className="flex rounded-full bg-neutral-100 p-1 text-sm">
+              {(['regions', 'ai'] as Mode[]).map((m) => (
+                <button
+                  key={m}
+                  data-testid={`mode-${m}`}
+                  onClick={() => setMode(m)}
+                  className={`flex-1 rounded-full py-1.5 ${
+                    mode === m ? 'bg-white shadow-sm font-medium' : 'text-neutral-500'
+                  }`}
+                >
+                  {m === 'regions' ? 'Regions' : 'AI lines'}
+                </button>
+              ))}
+            </div>
+
+            {mode === 'ai' && (
+              <p className="text-xs text-neutral-400" data-testid="ai-status">
+                {aiBusy
+                  ? 'Running the line model…'
+                  : aiMs !== null
+                    ? `Informative Drawings · ${aiMs}ms`
+                    : 'Informative Drawings'}
+              </p>
+            )}
+
+            <div className={`flex items-center gap-3 ${mode === 'ai' ? 'opacity-40' : ''}`}>
               <span className="text-sm text-neutral-500 w-12">Simple</span>
               <input
                 type="range"
