@@ -4,6 +4,9 @@ Copy everything in the fenced block below into Claude Code (or Cursor / Lovable 
 as your first message. Notes on adjusting it, and the reasoning behind the tricky
 parts, are at the bottom.
 
+Step 1 of this prompt is implemented in this repo — see `README.md`. The architecture
+below is the corrected one, rewritten after the first version was built and failed.
+
 ---
 
 ```
@@ -15,38 +18,64 @@ login, no backend — everything runs on-device.
 
 1. Upload or take a photo.
 2. It converts to clean black line art on white. A "Detail" slider (Simple →
-   Detailed) re-renders the line art as they drag it.
+   Detailed) re-renders the page as they drag it.
 3. Tap "Color it" → the line art becomes a colorable canvas.
 4. Tap a palette color, tap a region, it fills instantly with flat color.
 5. Undo, redo, reset, save PNG.
 
 ## Architecture — read this section twice, it is the whole product
 
-Never run a pixel flood fill at tap time. Edge-detected lines have single-pixel gaps
-and soft anti-aliased edges, so a tap-time flood escapes the shape and floods half
-the image. That is the #1 complaint about every app in this category.
+**Derive the lines from the regions, not the regions from the lines.**
 
-Instead, segment the image into regions once, up front, and make a tap a lookup.
+The obvious approach is edge detection (Canny/DoG) followed by flood fill. It does
+not work, and it is worth understanding why before you write any code. Edge
+detection on a photo produces *open contours* — a dog's outline comes out as a
+dashed line with gaps in it. A coloring page needs *closed shapes*. No amount of
+gap-sealing fixes this reliably: the fill escapes through the first gap and floods
+the page. That is the #1 complaint about every app in this category.
+
+So invert it. Segment the image into regions first; the lines are just where two
+regions meet. Every enclosed area is then closed **by construction** and a fill has
+nowhere to escape to. Leaks become structurally impossible rather than something you
+mitigate.
 
 **Pipeline (runs in a Web Worker):**
 
-1. Generate line art (algorithm below).
-2. Binarize hard — every pixel is LINE or FILLABLE. No gray, no alpha, no
-   in-between. Everything downstream depends on this being strictly binary.
-3. Seal gaps: morphological close on the LINE layer (dilate radius 2, then erode
-   radius 2). This joins hairline breaks before segmentation, which is what actually
-   prevents leaks.
-4. Connected-component labeling (two-pass with union-find, 4-connectivity) over the
-   FILLABLE pixels. Output an `Int32Array regionMap` of width*height holding a
-   region id per pixel, plus for each region: pixel count and bounding box. The
-   bounding boxes matter — see rendering.
-5. Absorb specks: any region smaller than 0.01% of image area becomes LINE. Do not
-   try to merge it into a neighbor; specks are line noise, and absorbing is simpler
-   and looks better. Re-label after absorbing.
-6. Leak check: if any single region other than the outer background covers more than
-   35% of fillable area, the line art has a hole. Automatically re-run from step 3
-   with close radius 3, then 4. If it still fails, keep the best result and continue
-   — do not block the user.
+1. Decode with `createImageBitmap(file, { imageOrientation: 'from-image' })`. Do not
+   skip this — phone photos carry EXIF rotation and will render sideways otherwise.
+2. Downscale so the long edge is 1400px. All processing happens at this resolution;
+   display is separate.
+3. Smooth with 2 passes of a 3×3 median filter, **on all three colour channels**.
+   Segmentation is a colour decision, so texture has to come out of colour, not
+   luma. (Use the 19-comparison median-of-9 sorting network, not a per-pixel sort —
+   at 1.5M pixels a generic sort is seconds of work.)
+4. Convert to CIELAB. Merging decisions are perceptual: two greens a human calls
+   "the same green" can be far apart in RGB.
+5. Quantise colour with k-means in Lab (k-means++ init). Run the iterations on a
+   ~20k-pixel subsample, then assign all pixels to the resulting centroids — full
+   k-means over every pixel is pointlessly slow for identical output.
+6. Two passes of a 3×3 majority (mode) filter over the cluster-index image. This
+   dissolves speckle and smooths the jagged cluster boundaries, and is most of what
+   turns an unusable segmentation into a usable one.
+7. Connected-component labeling of *equal-valued* runs (two-pass union-find,
+   4-connectivity). Output `Int32Array regionMap` plus per-region pixel count,
+   bounding box, and mean colour.
+8. Merge every region below a minimum size into whichever neighbour shares the
+   longest border with it, and repeat until nothing small is left (cap ~8 passes).
+   Track adjacency only for the small regions so the bookkeeping scales with the
+   noise, not the image.
+9. Lines = every pixel with a 4-neighbour in a different region. Optionally dilate
+   by 1 for ink weight at low detail levels.
+
+**The Detail slider** drives two numbers together: `k` (cluster count) and the
+minimum region size. That is the only thing "detail" means on a coloring page — how
+many shapes it has. Use ~5 discrete levels and **cache each level's segmentation**;
+revisiting a level is then instant and the slider feels live without any separate
+preview path.
+
+    level 0: k=6,  minRegionFrac=0.0022    level 3: k=16, minRegionFrac=0.00045
+    level 1: k=9,  minRegionFrac=0.0013    level 4: k=22, minRegionFrac=0.00025
+    level 2: k=12, minRegionFrac=0.0008
 
 **Tap handling:** `regionMap[y * width + x]` → a region id. That is the whole
 operation. No traversal.
@@ -60,67 +89,51 @@ That is the entire saved state. It is a few hundred bytes, not a bitmap. Therefo
   1400px a single RGBA snapshot is ~7.8MB and a 20-step undo stack will crash mobile
   Safari.
 - Reset is `map.clear()`.
-- Save/resume progress across reloads is JSON in localStorage, for free.
+- Save/resume across reloads is JSON in localStorage, for free.
+- "Fill with the photo's real colours" is one pass over the per-region mean colours
+  you already computed in step 7.
 
 **Rendering:** three stacked layers — white base, fill layer, black line layer on
 top (so lines always stay crisp over color). On a fill, repaint only the filled
-region's bounding box, not the whole canvas. Full repaint only on load and undo-all.
-
-## Line art algorithm
-
-Aim for FEW, THICK, CLOSED lines — a coloring page, not a photocopy. When in doubt,
-throw detail away. A simple page that colors nicely beats a detailed one that
-doesn't.
-
-1. Decode with `createImageBitmap(file, { imageOrientation: 'from-image' })`. Do not
-   skip this — phone photos carry EXIF rotation and will render sideways otherwise.
-2. Downscale so the long edge is 1400px. All processing happens at this resolution;
-   display is separate.
-3. Edge-preserving smooth to kill texture — skin pores, grass, and fabric weave must
-   not become lines. Use 2–3 passes of a 3×3 median filter (fast, hand-writable). A
-   true bilateral filter is better but too slow in JS at this size; don't bother.
-4. Grayscale (luma: 0.299R + 0.587G + 0.114B).
-5. Difference of Gaussians. Blur at σ and at 1.6σ using a **separable** kernel (two
-   1-D passes, not a 2-D convolution — 2-D is ~10× slower for identical output).
-   Then `dog = blurA - 0.985 * blurB`.
-   Starting values: σ ranges 1.0 (detailed) to 3.0 (simple); threshold ε around 0.5
-   on a 0–255 scale. Skip the XDoG tanh soft-thresholding curve — we binarize
-   anyway, so hard-threshold the DoG directly.
-6. Despeckle the LINE layer: drop line blobs under 0.005% of image area.
-7. Dilate surviving lines to 2–3px so they read as ink.
-
-**Making the slider actually live:** steps 1–4 run once on upload. Precompute the
-DoG at four fixed σ values (1.0 / 1.7 / 2.4 / 3.0) during that initial pass and keep
-all four. The slider then picks the nearest σ level and varies ε continuously —
-re-thresholding is a single cheap pass, so the preview updates every frame while
-dragging. Only re-run sealing and labeling (steps 3–6 of the pipeline) on slider
-release, not during the drag.
+region's bounding box, not the whole canvas.
 
 ## How to verify your own work
 
 You cannot see the output, so build the instruments:
 
-- A "debug" toggle that renders the region map in false color (deterministic hue per
-  region id). This makes leaks visible instantly — a leak looks like one color
-  spanning things that should be separate.
-- Log after labeling: region count, largest-region share of fillable area, and how
-  many close-radius retries were needed.
-- Sanity targets on a normal portrait photo at mid-detail: roughly 150–2000 regions,
-  largest non-background region under 35%. Ten regions means the line art collapsed;
-  50,000 means it's confetti. Either way the pipeline is wrong, not the photo.
-- Test with a portrait, a landscape, a pet, and a deliberately dark/low-contrast
-  photo. The dark one is the failure case — if it produces under 20 regions, show
-  the user "this photo didn't have enough contrast, try another" rather than a blank
-  page.
+- A "debug" toggle that renders the region map in false colour (deterministic hue
+  per region id). Correct output looks like a stained-glass window: every shape its
+  own hue, adjacent shapes clearly different. A leak looks like one hue spanning
+  things a human would call separate.
+- Log after every segmentation: total regions, interior regions (not touching the
+  image edge), largest region as a share of the image, ink share, and elapsed ms.
+- Sanity targets on a normal photo at mid detail: **30–150 regions**, at least half
+  of them interior, segmentation under ~700ms. Under 20 regions means the image had
+  nothing to segment; thousands means the merge step isn't running.
+- Measure the largest region **including** the background. Measuring only interior
+  regions hides the worst failure mode, where everything collapses into a single
+  border-touching blob and the interior count is zero.
+- Test with a portrait, a pet, a landscape, and a deliberately dark/low-contrast
+  photo. Expect the dark one to look like a topographic map — see Known limits.
+
+## Known limits — do not treat these as bugs
+
+- Photos that are mostly smooth gradients (night skies, fog, sunsets) segment into
+  concentric contour bands. It is a valid coloring page and a bad one. Detect it
+  (very few interior regions, or regions that are long and thin) and tell the user
+  the photo won't trace well rather than shipping them a contour map.
+- Faces lose fine features. Eyes and mouths come out as flat shapes. This is
+  inherent to colour segmentation and is not fixed by more clusters — more clusters
+  just adds noise elsewhere.
 
 ## Stack
 
 - Vite + React + TypeScript, Tailwind for styling.
-- Plain Canvas 2D + typed arrays. Hand-write the convolutions, the morphology, and
-  the labeling pass — no image-processing dependencies (OpenCV.js is an 8MB wasm
-  blob for four functions we need).
+- Plain Canvas 2D + typed arrays. Hand-write the convolutions, the morphology, the
+  labeling and the merge — no image-processing dependencies (OpenCV.js is an 8MB
+  wasm blob for a handful of functions).
 - Heavy pipeline in a Web Worker; transfer buffers, don't copy them. Show a progress
-  state — the initial pass will take 1–3 seconds and that is fine if it's honest.
+  state — the initial load takes ~0.5–2s and that is fine if it's honest.
 - UI nearly empty. The artwork is the interface.
 
 ## Acceptance checklist
@@ -129,9 +142,10 @@ Each item is testable — verify before telling me a step is done.
 
 - [ ] A photo taken in portrait orientation on a phone displays right-side up.
 - [ ] In debug view, no region spans two shapes a human would call separate.
+- [ ] A normal photo yields 30–150 regions with a majority interior.
 - [ ] Tap-to-painted is under 50ms on a 1400px image.
 - [ ] 50 fills then 50 undos leaves memory flat (no canvas snapshots on the stack).
-- [ ] Dragging the Detail slider updates the preview without a visible hitch.
+- [ ] Moving the Detail slider back to a previous level renders instantly (cached).
 - [ ] Pinch-zoom to 4×, pan, then tap — the correct region fills. Screen→image
       coordinate mapping must invert the full pan/zoom transform; getting this wrong
       is the most common bug in this kind of app and it only shows up when zoomed.
@@ -144,7 +158,7 @@ Each item is testable — verify before telling me a step is done.
 Stop after each step so I can look at it.
 
 1. Upload → line art on screen + working Detail slider + debug region-map toggle.
-2. Region map + tap-to-fill with a fixed palette.
+2. Tap-to-fill with a fixed palette.
 3. Undo/redo, reset, save PNG, pinch-zoom, localStorage persistence.
 
 Use a palette of ~24 colors: light and dark versions of each hue, four skin tones,
@@ -158,24 +172,38 @@ Start with step 1.
 
 ## What changed and why
 
-The first draft of this prompt had two bugs that would have shipped:
+Three defects, found in two rounds of review and one round of actually building it.
 
-**Canvas snapshots for undo.** "Undo is just swapping the fill layer" means storing a
-full bitmap per step — ~7.8MB each at 1400px. Twenty steps is 156MB and a crash on
-mobile Safari. Fixing it revealed the better design: because fills are region-based,
-the document is just `Map<regionId, color>`. That makes undo trivial, and it makes
-save/resume and instant reset fall out for free.
+**1. Canvas snapshots for undo (caught by review).** "Undo is just swapping the fill
+layer" means storing a full bitmap per step — ~7.8MB each at 1400px, so twenty steps
+is 156MB and a crash on mobile Safari. Fixing it revealed the better design: because
+fills are region-based, the document is just `Map<regionId, color>`. Undo becomes
+trivial, and save/resume and instant reset fall out for free.
 
-**"Cannot leak" was an overclaim.** Precomputing regions doesn't stop leaks — if a
-gap connects two areas, they become one region and the tap still fills both. It makes
-leaks *deterministic and detectable* instead of random. That's actually the stronger
-property, because you can catch a bad segmentation automatically and re-seal harder
-before the user ever sees it. Hence the leak check in step 6.
+**2. "Precomputed regions cannot leak" was an overclaim (caught by review).**
+Precomputing doesn't stop leaks — if a gap connects two areas they become one region
+and the tap still fills both. It makes leaks deterministic and detectable rather than
+absent.
 
-The rest: EXIF orientation (a guaranteed sideways-photo bug), concrete DoG constants
-so the agent isn't guessing at an algorithm it can't visually check, a slider design
-that's affordable to run live, the debug region-map view, and a testable checklist in
-place of vague quality goals.
+**3. The whole edge-detection architecture was wrong (caught by building it).** This
+is the one that mattered. The first version ran DoG edge detection, sealed gaps with
+morphological closing, then labeled the fillable areas. On a real photo of a dog it
+produced *one region* — the outline had gaps, so the dog's interior and the
+background were the same connected area. The line art looked like a pleasant pencil
+sketch and was completely unfillable.
+
+The leak check missed it, too, because it only measured the largest *interior*
+region — and there were none, so it reported 0% and declared success. Measuring the
+largest region including the background would have caught it immediately.
+
+The fix was to invert the pipeline: segment regions from colour first, then draw
+lines where regions meet. Same photo, same slider, now 70 regions with 60 interior
+and a closed silhouette. Closure stops being something you fight for and becomes a
+property of the construction.
+
+The lesson worth keeping: the debug region-map view and the logged region counts are
+what turned a plausible-looking failure into an obvious one in a single run. Build
+the instruments first.
 
 ## Tweaking it
 
@@ -184,15 +212,13 @@ place of vague quality goals.
 still the faster path to knowing whether the idea feels good, and it wraps to native
 later with Capacitor.
 
-**Want it hand-drawn rather than machine-traced?** Add: "After generating line art,
-redraw each contour as a slightly wobbling variable-width stroke so it reads as
-pen-on-paper rather than a filter."
+**Want cleaner, more deliberate shapes?** Simplify each region boundary with
+Douglas–Peucker before drawing it, and render as smoothed paths rather than pixel
+borders. This is the single biggest available quality win — it turns the slightly
+wobbly contour look into something that reads as drawn.
 
 **Optional additions, once the core works**
 
-- "Fill with the photo's real colors" — average the original photo's pixels within
-  each region and assign. One pass, nearly free given the architecture, and it
-  rescues the moment where someone gives up on a hard page.
 - Long-press a region to sample that spot's color from the original photo.
 - Print-friendly PDF of the blank line art. Parents and teachers want paper, and no
   competitor does this well.
